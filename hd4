@@ -1,0 +1,144 @@
+#!/bin/bash
+
+PATH=/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin
+echo
+md_devices=`cat /proc/mdstat | grep : | egrep -v '(Personalities|unused devices|bitmap)' | awk -F " :" '{print "/dev/"$1}'`
+parted=`parted -l`
+all_devs=`echo "$parted" | grep /dev/ | awk '{print $2}' | awk -F: '{print $1}' | grep -v Error`
+
+function print_help() {
+    echo "Version: 1.00"
+    echo ""
+    echo "Prints the following for every device in a raid:"
+    echo -e "'Device Model' 'Device'\t'Size' 'Disk Type'\t'Error Information'\t'Raid State'"
+    echo "Where 'Error Information' is comprised of:"
+    echo "'Temperature_Celsius'°C Errors: 'Offline_Uncorrectable'('Current_Pending_Sector','Reallocated_Sector_Ct')"
+    echo ""
+    echo "The first line for every raid gives a summary, this is comprised of:"
+    echo "1) Raid state (mdadm --detail /dev/mdX | grep \"State :\")"
+    echo "2) Blocks that are not synchronized between drives (cat /sys/block/mdX/md/mismatch_cnt)"
+    echo "3) Raid size (mdadm --detail /dev/mdX | grep \"Array Size :\")"
+    echo "4) Utilization (df -h | grep /dev/mdX)"
+    echo ""
+    echo "To get more information about a device:"
+    echo "smartctl --all /dev/sdX"
+    echo "To get more information about a raid:"
+    echo "mdadm --detail /dev/mdX"
+    echo "cat /proc/mdstat"
+    echo ""
+}
+function trim () {
+    sed -e 's/^ *//g' -e 's/ *$//g'
+}
+print_raid_summary() {
+    md=$1
+    md_info=$2
+    if [[ -f /sys/block/${md:5}/md/mismatch_cnt ]]; then
+        mismatch_cnt=`cat /sys/block/${md:5}/md/mismatch_cnt` # Number of unsynchronized blocks in the raid
+    # If mismatch_cnt != 0
+    # echo repair >/sys/block/md<#>/md/sync_action 
+    # ...which does not reset the count, but if you force a check after the rebuild is complete:
+    # echo check >/sys/block/md<#>/md/sync_action 
+    # ...then the count should return to zero.
+        if [[ "$mismatch_cnt" != "0" ]]; then
+            mismatch_cnt=`echo -e "\e[31m$mismatch_cnt\e[0m"` # Red
+        fi
+    else 
+        mismatch_cnt="no info"
+    fi
+    df_info_size=`df -h | egrep '(/dev/md|var|backup|download)' | grep $md | awk '{print $5, "("$3"/"$2")"}'`
+    if [[ ! -z $df_info_size ]]; then
+        df_info_size=", Utilization: $df_info_size"
+    else
+        df_info_size=""
+    fi
+    md_data=`echo -e "$md_info" | egrep '(Array Size|State :|Rebuild)' | trim`
+    while read line; do
+        if [[ "$line" =~ "State : " ]]; then
+            if [[ "$line" == "State : active" ]] || [[ "$line" == "State : active, checking" ]]; then
+                state=`echo -e "\e[32m${line:8}\e[0m"` # Green
+            elif [[ "$line" == "State : clean" ]] || [[ "$line" == "State : clean, checking" ]]; then
+                state=`echo -e "\e[33m${line:8}\e[0m"` # Yellow
+            else
+                state=`echo -e "\e[31m${line:8}\e[0m"` # Red
+            fi
+        else
+            if [[ `echo $line | awk -F: '{print $1}'` == "Array Size " ]]; then
+                md_info_size=`echo -n "$line" | awk '{print $7, $8}' | sed 's/)//'`
+            fi
+        fi
+    done <<< "$md_data"
+    echo -e "State: $state, Mismatch_cnt: $mismatch_cnt, Size: $md_info_size$df_info_size"
+}
+function filter_none_raid_devs() {
+    none_raid_devs=$1
+    devs_to_remove=$2
+    while read dev; do
+        none_raid_devs=`echo -e "$none_raid_devs" | grep -v "$dev"`
+    done <<< "$devs_to_remove"
+    echo -e "$none_raid_devs"
+}
+# Prints: 'Temperature_Celsius'°C Errors: 'Offline_Uncorrectable'('Current_Pending_Sector','Reallocated_Sector_Ct')
+function error_info() {
+    devs="/dev/sdfu" # dummy
+    devs="$1|$devs"
+    for f in `echo "$all_devs" | egrep -E $devs`; do
+        smartctl --all $f | egrep --color=never -e "Reallocated_Sector_Ct" -e "Temperature_Celsius" -e "Current_Pending_Sector" -e "Offline_Uncorrectable" | awk '{print $10}' | tr '\n' ' ' | awk '{print $2"°C " "Errors: "$4"("$3","$1")"}'
+    done
+}
+function disk_info() {
+    devs="/dev/sdfu" # dummy
+    devs="$1|$devs"
+    echo "$parted" | egrep -B 1 -e "/dev/c" -e "/dev/s" | egrep -v -e "\-\-" -e "Warning:" -e "Error" -e "has been opened read-only" | sed -e "s/://g" | sed -e "s/Array//g" |  sed '/^\s*$/d' | awk 'NR % 2 ==1 {gsub(" ","-"); print} NR % 2 ==0 {print}' | awk ' BEGIN {OFS = " "}{disk1="ls /sys/block | grep `basename " $2" 2>/dev/null` 2>/dev/null";disk1 | getline disk; var="cat /sys/block/"disk"/queue/rotational 2> /dev/null"; var | getline diskprint}   {if(NR%2==1){print $0} else if(diskprint=="1"){print $2"\t"$3 " HDD"} else if(diskprint=="0") {print $2"\t"$3 " SSD"} else {print $2"\t"$3} }' | sed 'N;s/\n/ /' | sed -e "s/Model-//g" | egrep -E $devs
+}
+print_with_warning() {
+    while read line; do
+        column=`echo -e "$line" | awk '{print $7}'`
+        uncorrectable=`echo -e "$column" | awk -F"(" '{print $1}'`
+        pending=`echo -e "$column" | awk -F"(" '{print $2}' | awk -F"," '{print $1}'`
+        if [[ $uncorrectable -ne 0 ]] || [[ $pending -ne 0 ]]; then
+            echo -e "\e[31m$line\e[0m"
+        else
+            echo "$line"
+        fi
+    done <<< "$1"
+}
+
+
+if [[ $1 = "-h" ]] || [[ $1 = "--help" ]]; then
+    print_help
+else
+#    echo ""
+#    echo "-----------------------------Disk Status: "`date`"-----------------------------"
+    
+    ## Raid Devices ##
+    none_raid_devs=$all_devs
+    for md in $md_devices; do
+        echo "### $md ###"
+        md_info==`mdadm --detail $md`
+        print_raid_summary "$md" "$md_info"
+        raid_devices=`echo -e "$md_info" | grep "Raid Devices" | awk -F: '{print $2}' | trim | awk '{s+=$1} END {print s}'`
+        raid_devs=`echo -e "$md_info" | tail -n$(($raid_devices)) | grep /dev/ | awk '{print $7}'`
+        devs_to_remove=`echo -e "$raid_devs" | sed 's/[0-9]*//g' ` 
+        none_raid_devs=$(filter_none_raid_devs "$none_raid_devs" "$devs_to_remove")
+        raid_devs=`echo -e "$raid_devs" | grep -v /dev/md`
+        raid_devs=`echo -e "$raid_devs" | tr '\n' '|' | sed s'/.$//' | sed 's/[0-9]*//g'`
+        error_info=$(error_info $raid_devs)
+        disk_info=$(disk_info $raid_devs)
+        disk_info=$(paste <(echo -e "$disk_info") <(echo -e "$error_info")  <(echo -e "$md_info" | egrep -E $raid_devs | awk '{print $7, $6, $5}'  | sort | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print $3, $2}'))
+        print_with_warning "$disk_info"
+        echo ""
+    done
+    ## Non-raid Devices ##
+    echo "### Non-raid ###"
+    none_raid_devs=`echo -e "$none_raid_devs" | tr '\n' '|' | sed s'/.$//' | sed 's/[0-9]*//g'`
+    #none_raid_devs=/dev/sdf
+    error_info=$(error_info $none_raid_devs)
+    disk_info=$(disk_info $none_raid_devs)
+    disk_info=$(paste  <(echo -e "$disk_info") <(echo -e "$error_info"))
+    print_with_warning "$disk_info"    
+    
+#    echo "---------------------------------------------------------------------------------------------------"
+#    echo ""
+    
+fi
